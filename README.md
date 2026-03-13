@@ -8,23 +8,108 @@ plugins. Small and boring on purpose.
 
 ---
 
+## Contents
+
+- [When to use it](#when-to-use-it)
+- [Features](#features)
+- [Install](#install)
+- [Run](#run)
+- [Configuration](#configuration)
+  - [server](#server)
+  - [server.security](#serversecurity)
+  - [server.redirect](#serverredirect)
+  - [server.unix](#serverunix)
+  - [trusted\_proxies](#trusted_proxies)
+  - [vhost](#vhost)
+  - [Pre-compressed files](#pre-compressed-files)
+- [TLS certificates](#tls-certificates)
+- [Deployment](#deployment)
+  - [Systemd](#systemd)
+  - [Let's Encrypt](#lets-encrypt)
+  - [Behind a reverse proxy](#behind-a-reverse-proxy)
+- [Build targets](#build-targets)
+- [Roadmap](#roadmap)
+- [License](#license)
+
+---
+
 ## When to use it
 
-- Personal sites, project pages, documentation hosts
-- Internal dashboards served over HTTPS
-- Raspberry Pi, embedded hardware, or any constrained box
-- Anywhere the server config should fit in one file you can read in two minutes
+femto is the right fit when:
 
-## When not to use it
+- You're serving static files — HTML, CSS, JS, images, fonts, downloads
+- You want proper TLS and HTTP/3 without configuring a full web server
+- You're on constrained hardware: a Raspberry Pi, a cheap VPS, an embedded
+  device where every megabyte of RAM counts
+- You want a single binary you can drop anywhere and run, with one config file
+  you can read in a few minutes
+- You need virtual hosting across multiple domains from one process
 
-If you need PHP, CGI, URL rewrites, proxying, or anything dynamic — use a full
-web server. femto does not plan to grow those features.
+femto is **not** the right fit when you need:
+
+- Dynamic content, CGI, FastCGI, or server-side scripting
+- URL rewriting or complex routing rules
+- Reverse proxying to upstream services
+- Load balancing
+- Any plugin or module system
+
+If you need those things, reach for nginx, Caddy, or a purpose-built
+application server. femto does not plan to grow in that direction.
+
+---
+
+## Features
+
+**Protocol**
+- TLS 1.3 minimum — older versions are not negotiated
+- HTTP/3 (QUIC) + HTTP/2 + HTTP/1.1 served from the same port; clients
+  negotiate the best protocol they support automatically
+- `Alt-Svc` header sent on every TCP response to advertise HTTP/3
+
+**Hosting**
+- Virtual hosting with per-vhost document roots, TLS certificates, and
+  cache settings
+- Exact domain names and single-level wildcards (`*.example.com`)
+- Directory listing on/off per vhost
+- Configurable index file list, tried in order
+
+**Performance**
+- Pre-compressed file serving: drop `.br` or `.gz` sidecars next to your
+  files and femto serves them automatically to clients that support them —
+  no runtime compression, no CPU overhead at request time
+- Per-vhost `Cache-Control` — sends `public, max-age=N` on 2xx and 304
+  responses; error responses are never cached
+
+**Operations**
+- Zero-downtime TLS certificate reload on `SIGHUP` — no dropped connections,
+  works with Let's Encrypt renewal hooks
+- Graceful shutdown on `SIGTERM` / `SIGINT` — in-flight requests complete
+  before the process exits
+- HTTP → HTTPS redirect listener — bind a plain HTTP port and femto issues
+  301 redirects; Host header is validated to prevent open redirects
+- Unix domain socket listener for local reverse proxy setups
+- Structured access log: one line per request with remote IP, protocol,
+  method, URI, status, bytes, duration, and user-agent
+
+**Security**
+- Security headers on every response: HSTS, `X-Content-Type-Options`,
+  `X-Frame-Options`, `Content-Security-Policy`, `Referrer-Policy`,
+  `Permissions-Policy` — configurable per header, sensible defaults
+- Trusted proxy support: reads real client IPs from `Forwarded` (RFC 7239)
+  or `X-Forwarded-For` only from configured CIDRs
+
+**Miscellaneous**
+- Hard connection cap (`max_connections`) and five independent timeouts
+- Custom MIME types via an optional `mime.types` file layered on top of
+  built-in defaults
+- Single static binary, ~10 MB stripped — no shared libraries, no runtime,
+  no install step
 
 ---
 
 ## Install
 
-Requires Go 1.24.
+Requires Go 1.24 or later.
 
 ```
 git clone https://github.com/monkburger/femto
@@ -32,155 +117,308 @@ cd femto
 make static
 ```
 
-That gives you a stripped static binary. Copy it anywhere and run it.
+`make static` produces a fully stripped, statically linked binary with no
+CGO. Copy it to any Linux/macOS/\*BSD machine and run it.
 
-To bind ports below 1024 without running as root on Linux:
+On Linux, to bind ports 80 and 443 without running as root:
 
 ```
 make setcap
 ```
+
+This calls `setcap cap_net_bind_service=+ep` on the binary. You only need to
+redo this after recompiling.
 
 ---
 
 ## Run
 
 ```
-./femto -config femto.toml
+./femto -config /etc/femto/femto.toml
 ```
 
-`-config` defaults to `femto.toml` in the current directory. No other flags.
+`-config` defaults to `femto.toml` in the current directory. That is the only
+flag.
 
-- `SIGTERM` / `SIGINT` — graceful shutdown
-- `SIGHUP` — reload TLS certificates from disk without dropping connections
+Signals:
 
----
+| Signal | Effect |
+|--------|--------|
+| `SIGTERM` | Graceful shutdown — waits for in-flight requests to finish |
+| `SIGINT` | Same as SIGTERM |
+| `SIGHUP` | Reload TLS certificates from disk — no connections dropped |
 
-## Features
+To test locally, an example config and self-signed certificate for localhost
+are in `example/`. Start with:
 
-- **TLS 1.3 minimum.** Older versions are not negotiated.
-- **HTTP/3 (QUIC) + HTTP/2 + HTTP/1.1.** Clients get the best protocol they
-  support. `Alt-Svc` is advertised automatically on every TCP response.
-- **Virtual hosting.** Exact names and `*.wildcard` both work, each with its
-  own document root and certificate.
-- **Pre-compressed serving.** Drop a `.br` or `.gz` sidecar next to any file
-  and femto serves it to clients that ask for it. No runtime compression.
-- **Zero-downtime cert reload** via `SIGHUP`. Works with Let's Encrypt renewal
-  hooks.
-- **HTTP → HTTPS redirect listener.** Bind a plain HTTP port and femto issues
-  301s. Host header is validated — no open redirect.
-- **Unix domain socket.** Plain HTTP/1.1 for a local reverse proxy setup.
-- **Trusted proxy support.** Reads real client IPs from `Forwarded` (RFC 7239)
-  or `X-Forwarded-For` when the request arrives from a trusted CIDR.
-- **Security headers.** HSTS, CSP, `X-Frame-Options`, referrer policy, and
-  permissions policy — all configurable, sensible defaults included.
-- **Per-vhost `Cache-Control`.** Set a max-age and femto sends
-  `Cache-Control: public, max-age=N` on successful responses only. Error
-  responses are never cached.
-- **Connection cap and five independent timeouts.**
-- **Structured access log.** One line per request: remote IP, protocol,
-  method, URI, status, bytes, duration, user-agent.
-- **Custom MIME types.** Point to a `mime.types` file to extend the built-ins.
+```
+./femto -config example/example.toml
+curl --insecure https://localhost:8443/
+```
 
 ---
 
-## Config
+## Configuration
 
-TOML. A working example with every option is in `example/example.toml`.
+femto uses [TOML](https://toml.io) — a minimal config format designed to be
+easy to read. If you haven't used it before, it's roughly INI with types. The
+full spec is at [toml.io](https://toml.io) and takes about ten minutes to read.
+
+A fully annotated example config is in [`example/example.toml`](example/example.toml).
+
+---
 
 ### `[server]`
 
 ```toml
 [server]
-listen = ["443"]          # bare port, "host:port", or "[::]:port" for IPv6
-access_log = ""           # "" or "stderr" = stderr | "off" = discard | file path
-error_log  = ""
 
+# Addresses to listen on for TLS (TCP + QUIC/UDP). One listener pair per entry.
+# Formats: bare port "443", "host:port", or "[::]:443" for all IPv6 interfaces.
+# Default: ["0.0.0.0:443"]
+listen = ["443"]
+
+# Path to an additional mime.types file. Empty = built-in types only.
+# mime_types = "/etc/femto/mime.types"
+
+# Log destinations.
+# "" or "stderr" — write to standard error (default)
+# "off"          — discard entirely
+# "/path/to/file" — append to that file; created if missing (mode 0640)
+access_log = "/var/log/femto/access.log"
+error_log  = "/var/log/femto/error.log"
+
+# How long to wait for the client to send request headers. Tighten this on
+# exposed servers to blunt slow-loris style attacks.
 read_header_timeout = "5s"
-read_timeout        = "30s"
-write_timeout       = "60s"
-idle_timeout        = "120s"
-shutdown_timeout    = "10s"
 
-max_header_bytes = 65536
-max_connections  = 0      # 0 = unlimited
+# Time to read the full request (headers + body).
+read_timeout = "30s"
+
+# Time allowed to send the full response.
+write_timeout = "60s"
+
+# How long an idle keep-alive connection is kept open.
+idle_timeout = "120s"
+
+# Grace period on SIGTERM/SIGINT before connections are forcibly closed.
+shutdown_timeout = "10s"
+
+# Maximum request header size in bytes. Requests larger than this get a 431.
+max_header_bytes = 65536  # 64 KB
+
+# Hard cap on concurrent TCP connections per listen address.
+# 0 = unlimited. Set a value on constrained hardware to protect memory.
+max_connections = 0
 ```
+
+---
 
 ### `[server.security]`
 
-All have sensible defaults. Set a field to `""` to suppress that header.
+These headers go out on every response regardless of vhost. Setting any field
+to `""` suppresses that header entirely.
 
 ```toml
 [server.security]
-hsts                    = "max-age=63072000; includeSubDomains; preload"
-content_type_options    = "nosniff"
-frame_options           = "DENY"
+
+# HTTP Strict Transport Security. The two-year value below is the minimum for
+# HSTS preloading (hstspreload.org).
+hsts = "max-age=63072000; includeSubDomains; preload"
+
+# Prevents MIME-type sniffing in browsers.
+content_type_options = "nosniff"
+
+# Clickjacking protection. SAMEORIGIN allows framing from the same origin.
+frame_options = "DENY"
+
+# Content Security Policy. Tighten this per your application's needs.
 content_security_policy = "default-src 'self'"
-referrer_policy         = "strict-origin-when-cross-origin"
-permissions_policy      = ""   # not sent unless set
+
+# Controls how much referrer information is sent with outbound requests.
+referrer_policy = "strict-origin-when-cross-origin"
+
+# Feature/permissions policy. Empty = header not sent.
+permissions_policy = ""
 ```
 
+---
+
 ### `[server.redirect]`
+
+When enabled, femto binds plain HTTP listeners that issue 301 redirects to the
+HTTPS equivalent. The Host header is validated against configured vhosts — a
+crafted Host cannot redirect to an external domain.
 
 ```toml
 [server.redirect]
 enabled = true
-listen  = ["80"]   # defaults to ["80"] if omitted
+listen  = ["80"]   # defaults to ["80"] when omitted
 ```
 
+---
+
 ### `[server.unix]`
+
+Starts a plain HTTP/1.1 listener on a Unix domain socket in addition to the
+TLS/QUIC listeners. Useful when a local reverse proxy (nginx, haproxy, Caddy)
+terminates TLS and forwards to femto over the socket, avoiding TLS overhead and
+an open network port.
 
 ```toml
 [server.unix]
 enabled = true
 path    = "/run/femto/femto.sock"
-mode    = 0660
+
+# Permission bits applied to the socket file after creation.
+# 0660 = owner + group can connect. 0600 = owner only.
+mode = 0660
 ```
+
+---
 
 ### `trusted_proxies`
 
+Tells femto which upstream addresses are allowed to set `Forwarded` or
+`X-Forwarded-For` headers that it will trust for real IP extraction. Everything
+else uses `RemoteAddr` directly.
+
 ```toml
 [server]
-trusted_proxies = ["127.0.0.1/32", "10.0.0.0/8"]
+trusted_proxies = [
+    "127.0.0.1/32",    # local loopback
+    "::1/128",         # IPv6 loopback
+    "10.0.0.0/8",      # private range
+]
 ```
+
+`Forwarded` (RFC 7239) takes precedence over `X-Forwarded-For` when both
+are present.
+
+---
 
 ### `[[vhost]]`
 
-At least one required.
+At least one `[[vhost]]` block is required. Each one defines a set of domain
+names, a document root, and a TLS certificate to use for those names.
+
+```toml
+[[vhost]]
+
+# One or more hostnames this vhost answers to. Required.
+# Supports exact names and single-level wildcards (*.example.com).
+server_names = ["example.com", "www.example.com"]
+
+# Directory to serve. Must exist and be a directory at startup. Required.
+document_root = "/var/www/example"
+
+# Whether to serve directory listings. Default: false.
+# When false and no index file is found, returns 403.
+dir_listing = false
+
+# Files to look for when a directory is requested, tried in order.
+# Default: ["index.html"]
+index_files = ["index.html", "index.htm"]
+
+# Cache-Control max-age for 2xx and 304 responses from this vhost.
+# Uses Go duration syntax: "24h", "7d", "30m", etc.
+# 0 or omitted = no Cache-Control header sent.
+# Error responses (4xx, 5xx) are never cached regardless of this setting.
+cache_max_age = "24h"
+
+  [vhost.tls]
+  # PEM certificate file. Can be a full-chain bundle (leaf + intermediates
+  # concatenated), such as Let's Encrypt's fullchain.pem.
+  cert = "/etc/ssl/example.com/fullchain.pem"
+
+  # PEM private key file.
+  key = "/etc/ssl/example.com/privkey.pem"
+
+  # Optional: path to a separate PEM file of intermediate CA certificates,
+  # in order from issuing intermediate to root. Leave empty when cert is
+  # already a full-chain bundle. Do not include the root CA — browsers
+  # already have it and including it wastes handshake bytes.
+  chain = ""
+```
+
+Multiple vhosts in one file:
 
 ```toml
 [[vhost]]
 server_names  = ["example.com", "www.example.com"]
 document_root = "/var/www/example"
-dir_listing   = false
-index_files   = ["index.html"]   # tried in order; default is ["index.html"]
-cache_max_age = "24h"            # omit or 0 to send no Cache-Control
-
   [vhost.tls]
-  cert  = "/etc/ssl/example.com/fullchain.pem"
-  key   = "/etc/ssl/example.com/privkey.pem"
-  chain = ""   # separate intermediate chain; leave empty for full-chain bundles
-```
+  cert = "/etc/ssl/example.com/fullchain.pem"
+  key  = "/etc/ssl/example.com/privkey.pem"
 
-`server_names` accepts exact names and single-level wildcards (`*.example.com`).
-Deeper wildcards are not supported.
-
-### Pre-compressed files
-
-No config needed. For any requested file `foo.html`, femto checks for
-`foo.html.br` and `foo.html.gz` in the same directory. If the client's
-`Accept-Encoding` matches and the sidecar is there, it gets served with the
-right `Content-Encoding` header.
-
-Generate sidecars at deploy time:
-
-```
-brotli -k foo.html
-gzip   -k foo.html
+[[vhost]]
+server_names  = ["*.apps.internal"]
+document_root = "/var/www/apps"
+  [vhost.tls]
+  cert = "/etc/ssl/apps.internal/fullchain.pem"
+  key  = "/etc/ssl/apps.internal/privkey.pem"
 ```
 
 ---
 
-## Systemd
+### Pre-compressed files
+
+femto can serve pre-compressed versions of static files without any runtime
+compression. For any requested path — say `/app.js` — it checks for sidecars in
+the same directory in this order:
+
+1. `app.js.br` — served as `Content-Encoding: br` if the client sends
+   `Accept-Encoding: br`
+2. `app.js.gz` — served as `Content-Encoding: gzip` if the client sends
+   `Accept-Encoding: gzip`
+3. `app.js` — served uncompressed as a fallback
+
+`Vary: Accept-Encoding` is added automatically. No configuration required.
+
+Generate sidecars at deploy time (keep originals with `-k`):
+
+```
+brotli -k /var/www/example/app.js
+gzip   -k /var/www/example/app.js
+```
+
+---
+
+## TLS certificates
+
+femto expects a PEM certificate and a PEM private key per vhost. Any CA works.
+For production, [Let's Encrypt](https://letsencrypt.org) via
+[certbot](https://certbot.eff.org) or [acme.sh](https://acme.sh) is the
+standard low-cost option.
+
+Quick certbot example (standalone, run before starting femto):
+
+```
+certbot certonly --standalone -d example.com -d www.example.com
+```
+
+This writes `fullchain.pem` and `privkey.pem` to
+`/etc/letsencrypt/live/example.com/`. Point `cert` and `key` there.
+
+Renewal hook to reload without restarting:
+
+```
+/etc/letsencrypt/renewal-hooks/deploy/femto-reload.sh
+---
+#!/bin/sh
+systemctl kill --signal=HUP femto
+```
+
+femto picks up the new certificates on `SIGHUP` with no downtime.
+
+For development, the `example/` directory includes a self-signed certificate
+for `localhost` / `127.0.0.1` / `::1`. Never use that in production.
+
+---
+
+## Deployment
+
+### Systemd
 
 ```ini
 [Unit]
@@ -199,16 +437,89 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 ```
 
+Reload config (certificates) without restarting:
+
+```
+systemctl reload femto
+```
+
+### Let's Encrypt
+
+See the [TLS certificates](#tls-certificates) section above.
+
+### Behind a reverse proxy
+
+If nginx, Caddy, or haproxy sits in front of femto, the recommended setup is
+to have femto listen on a Unix domain socket:
+
+```toml
+[server.unix]
+enabled = true
+path    = "/run/femto/femto.sock"
+mode    = 0660
+
+[server]
+trusted_proxies = ["127.0.0.1/32"]
+```
+
+Then configure the proxy to forward to `unix:/run/femto/femto.sock` and pass
+`X-Forwarded-For` or `Forwarded`. femto will log the real client IP.
+
+Direct TLS and the Unix socket can both be active at the same time — useful
+during a migration.
+
+---
+
+## Build targets
+
+```
+make build    # development build (dynamically linked, fast)
+make static   # production build (static, stripped, version-stamped)
+make release  # like static but names the output with version + arch
+make setcap   # grant the binary cap_net_bind_service (run after each build)
+make check    # vet + full test suite (CI gate)
+make test     # test suite only
+make cover    # test suite + HTML coverage report
+make fmt      # gofmt all source files
+make tidy     # go mod tidy + verify
+make clean    # remove build artifacts
+```
+
+---
+
+## Roadmap
+
+femto is deliberately small and the core feature set is considered stable.
+There are a few things worth doing in future that stay within the original
+scope:
+
+- **Access control lists.** Simple IP allowlists per vhost, without touching
+  the proxy/routing space.
+- **ETag hardening.** The current ETag comes from `http.FileServer`'s
+  default (inode + mtime + size). A content-hash ETag would be stronger and
+  portable across instances.
+- **Structured JSON access log.** The current log format is human-readable.
+  A JSON mode would make it easier to pipe into log aggregators.
+- **Plugin or hook interface (tentative).** There's been thought about a
+  narrow request/response hook interface — something that would let small
+  Go binaries or scripts participate in request handling without femto
+  growing a full scripting engine. Nothing is designed or committed yet.
+  If that ever ships, it would stay optional and the no-plugin path would
+  remain zero-overhead.
+
+What is not on the roadmap: reverse proxying, CGI, server-side scripting,
+template rendering, or a control API. Those belong in a different tool.
+
 ---
 
 ## A note on the docs
 
 This documentation follows plain language conventions — short sentences, active
 verbs, concrete examples. That approach comes out of cognitive linguistics and
-readability research: readers make fewer mistakes and get to the answer faster
-when instructions are written at the level of the task, not above it. Grice's
-maxims of quantity and manner are a useful frame here — say what's needed, no
-more, and say it clearly.
+readability research: readers make fewer errors and reach the answer faster
+when documentation is written at the level of the task, not above it.
+Grice's maxims of quantity and manner are a useful frame: say what's needed,
+no more, and say it clearly.
 
 ---
 
